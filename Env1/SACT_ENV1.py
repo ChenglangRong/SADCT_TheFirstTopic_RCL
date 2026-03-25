@@ -1,0 +1,1419 @@
+"""
+
+单臂单组合设备调度环境
+ LL→PM1→PM2→PM3→LL
+ LL→PM4→PM5→PM6→LL
+
+"""
+import numpy as np
+import simpy
+import argparse
+
+# -------------------------------------------------
+#   分析器类
+# -------------------------------------------------
+class system_profiler(object):
+    def __init__(self, modules_name, module_list, loadlock, robot, tot_wafer):
+        self.reward = 0
+        self.total_wafer = tot_wafer  # 当前需要加工的晶圆数量
+        self.system_state = None
+        self.state = list()
+        self.modules_name = modules_name  # 名称列表 【PM1,PM2,PM3,PM4,PM5,PM6】
+        self.modules_list = module_list  # PM对象列表
+        self.entry_wafer = 0
+        self.exit_wafer = 0
+        self.pre_exit_wafer = 0  # 上一个状态下，完成加工的晶圆数
+        self.pre_entry_wafer = 0  # 上一个状态下，待加工的晶圆数
+        self.robot = robot   # robot实体
+        self.loadlock = loadlock
+        self.loadlock_idle_time = 0
+        self.robot_current_module = None
+        self.robot_wait_time = 0
+        self.state_values = list()
+        self.pre_state = list()
+        self.last_action = None
+        self.current_action = None
+        self.processing_wafer_count = 0  # 当前系统中需要清空的晶圆数量
+        self.wafer_type_count = {1:0, 2:0}  # 记录每种类型晶圆的数量
+        for name in self.modules_name:  # 各pm当前的状态值
+            self.state_values.append(
+                {'name': name, 'wafer_count': 0, 'process_time_remaining': 0, 'residency_time_remaining': 0,
+                  'wafer_start_time': 0, 'wafer_state': None,'processed_time':0,'residency_time':0, 'wafer_type': None})
+            self.pre_state.append(
+                {'name': name, 'wafer_count': 0, 'process_time_remaining': 0, 'residency_time_remaining': 0,
+                  'wafer_start_time': 0, 'wafer_state': None,'processed_time':0,'residency_time':0, 'wafer_type': None})
+
+    # ======= 更新各PM的状态 =======
+    def update_modules_state(self, target, wafer_count, process_time_remaining, residency_time_remaining, pm_state,
+                             wafer_start_time, wafer_state,wafer_processed_time,wafer_residency_time, wafer_type=None):
+        for item in self.state_values:
+            if target == item['name']:
+                item['wafer_count'] = wafer_count
+                if wafer_count > 0:
+                    self.processing_wafer_count += 1
+                    if wafer_type:
+                        item['wafer_type'] = wafer_type
+                item['process_time_remaining'] = process_time_remaining
+                item['residency_time_remaining'] = residency_time_remaining
+                item['wafer_start_time'] = wafer_start_time
+                item['processed_time'] = wafer_processed_time
+                item['residency_time'] = wafer_residency_time
+
+    # ======= 更新LL的状态 =======
+    def update_loadlock_state(self, entry_count, exit_count, wafer_type=None):
+        self.entry_wafer = entry_count  # 待加工的晶圆数量
+        self.exit_wafer = exit_count  # 清除回到LL的晶圆数量
+        if wafer_type:
+            self.wafer_type_count[wafer_type] += 1
+
+    # ======= 更新robot的状态 =======
+    def update_robot_state(self, robot_current_module, robot_wait_time):
+        if robot_current_module == 'LL':
+            self.robot_current_module = 0
+        else:
+            self.robot_current_module = self.modules_name.index(robot_current_module) + 1
+        self.robot_wait_time = robot_wait_time
+
+    def update_system_wafer_state(self):
+        self.processing_wafer_count = 0
+        for item in self.state_values:
+            if item['wafer_count'] > 0:
+                self.processing_wafer_count += 1
+
+    # ======= 获取状态 =======
+    def get_state(self):
+        self.state = list()
+        self.state.append(self.exit_wafer)              # 加工完成后回到LL的晶圆数量
+        self.state.append(self.entry_wafer)              # 待加工的晶圆数量
+        self.state.append(self.robot_current_module)     # robot当前位置
+        self.state.append(self.processing_wafer_count)  # 组合设备系统中当前正在加工的晶圆数量
+
+        # 添加两种晶圆的计数
+        self.state.append(self.wafer_type_count[1])
+        self.state.append(self.wafer_type_count[2])
+
+        for item in self.state_values:
+            self.state.append(item['wafer_count'])
+            self.state.append(0 if item['wafer_count'] == 0 else item['wafer_type']) # 晶圆类型
+            self.state.append(item['process_time_remaining'])
+            self.state.append(item['residency_time_remaining'])
+            self.state.append(item['processed_time'])
+            self.state.append(item['residency_time'])
+
+        return self.state
+
+    def get_state_dim(self):
+        return len(self.get_state())
+
+    # ======= 获取奖励 =======
+    def get_reward(self, robot_action_flag, fail_flag, bottleneck_time):
+        success_flag = False
+        self.reward = 0
+        if fail_flag:
+            self.reward = -2000
+            success_flag = False
+
+        if self.exit_wafer == self.total_wafer:  # 系统中晶圆已经清空完毕
+            self.reward += 2000
+            success_flag = True
+
+        if self.robot.current_module == 'LL' and self.pre_exit_wafer + 1 == self.exit_wafer:  # 说明有新的晶圆回到LL
+            self.reward += 30
+            self.pre_exit_wafer = self.exit_wafer
+
+        self.reward += self.processing_wafer_count * 10
+
+        if self.robot.take_action_time > 0:
+            self.reward -= self.robot.take_action_time
+
+        # 增加中间奖励，鼓励探索不同动作
+        if robot_action_flag:
+            self.reward += 10
+
+        return self.reward, success_flag
+
+    # ======= 打印信息 =======
+    def print_info(self, reward, env):
+        print('------------------------------------------------执行动作完毕后的系统状态--------------')
+        print('LL中尚未加工的晶圆数:   {0}'.format(self.entry_wafer))
+        print('加工完成后返回LL的晶圆数:   {0}'.format(self.exit_wafer))
+        print('当前系统中正在加工的晶圆数量:   {0}'.format(self.processing_wafer_count))
+        print('本次动作robot等待时间:   {0}'.format(self.robot.wait_time))
+        print('robot完成动作时间:   {0}'.format(self.robot.take_action_time))
+        print(f"robot当前位于:{self.robot.current_module}")
+        for item in self.state_values:
+            print('{0}\t是否存在晶圆:{1}\t晶圆类型:{2}\t晶圆剩余加工时间:{3}\t剩余驻留时间:{4}\t晶圆已经加工时间:{5}\t晶圆已经驻留时间时间:{6}\t'
+                  '晶圆在当前PM开始加工时间:{7}'.format(item['name'],
+                                                    item['wafer_count'],
+                                                    item['wafer_type'] if item['wafer_count'] > 0 else 'N/A',
+                                                    item['process_time_remaining'],
+                                                   item['residency_time_remaining'],
+                                                   item['processed_time'],
+                                                   item['residency_time'],
+                                                   item['wafer_start_time']))
+
+        print('当前奖励: {0}  当前时间:{1}'.format(reward, env.now))
+
+
+# -------------------------------------------------
+#   晶圆类
+# -------------------------------------------------
+class Wafer(object):
+    def __init__(self, id, state, is_virtual, process_time, max_stay_time, wait_time, wafer_type):
+        self.id = id
+        self.state = state  # 晶圆当前所在的加工模块
+        self.is_broken = False  # 晶圆是否损坏
+        self.is_virtual = is_virtual  # 晶圆是否为虚拟晶圆
+        self.process_time = process_time  # 加工时间列表
+        self.max_stay_time = max_stay_time  # 加工完成后允许在PM驻留的最大时间，列表
+        self.wait_time = wait_time  # 等待时间
+        self.wafer_type = wafer_type  # 晶圆类型(1或2)
+        self.process_step = 0  # 当前处理步骤
+        self.path = self.get_path()  # 晶圆的加工路径
+
+    def get_path(self):
+        """根据晶圆类型返回对应的加工路径"""
+        if self.wafer_type == 1:
+            return ["LL", "PM1", "PM2", "PM3", "LL"]
+        elif self.wafer_type == 2:
+            return ["LL", "PM4", "PM5", "PM6", "LL"]
+        else:
+            return []
+
+    def get_next_module(self):
+        """获取当前步骤的下一个模块"""
+        if self.process_step < len(self.path) - 1:
+            return self.path[self.process_step + 1]
+        return None
+
+
+# -------------------------------------------------
+#   PM类
+# -------------------------------------------------
+class ProcessModule(object):
+    def __init__(self, env, name, process_time, max_stay_time, wait_time, pre_module, next_module, loadlock, robot,
+                 module_list, wafer_types_allowed=None):
+        self.env = env
+        self.name = name
+        self.process_time = process_time
+        self.max_stay_time = max_stay_time
+        self.wait_time = wait_time
+        self.pre_module = pre_module
+        self.next_module = next_module
+        self.loadlock = loadlock
+        self.robot = robot
+        self.module_list = module_list
+        self.state = None
+        self.store = simpy.Store(self.env)
+        self.monitoring_data = []
+        self.wafer_start_time = 0  # 当前晶圆进入PM的时间
+        self.last_wafer_left_time = 0  # 上一个晶圆，离开的时间
+        self.idle_time = 0
+        self.fail = False  # 失败标记
+        self.wafer_types_allowed = wafer_types_allowed or []  # 允许处理的晶圆类型
+
+    # ======= PM加工进程 =======
+    def processing(self, process_time):
+        yield self.env.timeout(process_time)  # 模拟加工晶圆
+        self.store.items[0].state = self.name  # 加工完成，标记晶圆状态为当前模块名称
+        # 更新晶圆处理步骤
+        self.store.items[0].process_step += 1
+
+    # ======= 加载晶圆到PM =======
+    def load(self, wafer):
+        if self.store.items.__len__() == 1:
+            print(f"{self.name}加载晶圆失败,已有晶圆存在")
+            self.fail = True
+            return
+        # 检查晶圆类型是否允许在此PM处理
+        if self.wafer_types_allowed and wafer.wafer_type not in self.wafer_types_allowed:
+            print(f"{self.name}不允许处理类型{wafer.wafer_type}的晶圆")
+            self.fail = True
+            return
+        # 检查晶圆来源是否正确
+        # 原逻辑：if self.pre_module != wafer.state:
+        # 修改为：检查当前模块是否是晶圆路径中的下一个模块
+        next_module = wafer.get_next_module()
+        if next_module != self.name:
+            print(f"{self.name}加载晶圆失败，加工顺序不匹配。预期{next_module}，实际{self.name}")
+            self.fail = True
+            return
+
+        self.fail = False
+        self.max_stay_time = wafer.max_stay_time[self.name]
+        self.process_time = wafer.process_time[self.name]
+        self.store.put(wafer)
+        self.wafer_start_time = self.env.now  # 记录晶圆开始进入PM的时间
+        self.env.process(self.processing(self.process_time))  # 启动加工进程
+
+    # ======= 从PM卸载晶圆 =======
+    def unload(self):
+        if self.store.items.__len__() == 0:
+            self.fail = True
+            print(f"{self.name}卸载晶圆失败，当前PM不存在晶圆")
+            return None
+
+        if self.env.now - self.wafer_start_time < self.process_time and self.state != 'fail':
+            self.fail = True
+            print(f"{self.name}卸载晶圆失败，未到达加工时间")
+            return None
+
+        if self.env.now - self.wafer_start_time > self.process_time + self.max_stay_time and self.state != 'fail':
+            self.fail = True
+            print(f"{self.name}卸载晶圆失败，违反了驻留时间约束")
+            wafer = self.store.get()
+            wafer.is_broken = True  # 晶圆损坏
+            if type(wafer) is simpy.resources.store.StoreGet:
+                return wafer.value
+            return wafer
+
+        self.fail = False
+
+        wafer = self.store.get()
+        self.last_wafer_left_time = self.env.now
+        self.wafer_start_time = 0
+        if type(wafer) is simpy.resources.store.StoreGet:
+            return wafer.value
+
+        return wafer
+
+    # ======= 获取当前PM的晶圆数量 =======
+    def get_wafer_count(self):
+        return self.store.items.__len__()
+
+    # ======= 获取当前PM的晶圆 =======
+    def get_current_wafer(self):
+        if self.store.items.__len__() == 1:
+            return self.store.items[-1]
+        return None
+
+    # ======= 获取当前PM的晶圆的状态 =======
+    def get_wafer_state(self):
+        if self.store.items.__len__() == 1:
+            return self.store.items[-1].is_broken
+        return None
+
+    # ======= 获取当前PM的晶圆剩余的加工时间 =======
+    def get_process_remaining_time(self):
+        if self.store.items.__len__() != 0:  # 当前存在晶圆
+            wafer = self.store.items[0]
+            self.process_time = wafer.process_time[self.name]
+            return self.process_time - self.env.now + self.wafer_start_time
+        return 0
+
+    # ======= 获取当前PM的晶圆剩余的驻留时间 =======
+    def get_residency_remaining_time(self):
+        if self.store.items.__len__() != 0:  # 当前存在晶圆
+            wafer = self.store.items[0]
+            self.max_stay_time = wafer.max_stay_time[self.name]
+            self.process_time = wafer.process_time[self.name]
+            upper_limit = self.max_stay_time + self.process_time
+            residence_time = self.env.now - self.wafer_start_time
+            return (upper_limit - residence_time)
+        return 0  # 神经网络不能输入无穷值，返回0,则说明不存在晶圆
+
+    # ======= 获取当前PM的两次加工之间的空闲时间 =======
+    def get_idle_time(self):
+        return 0
+
+    # ======= 获取robot在PM前等待卸载晶圆的时间 =======
+    def get_wait_time(self):
+        current_time = self.env.now
+        if self.store.items.__len__() == 0:  # 当前PM没有晶圆
+            self.fail = True
+            return 0
+        else:
+            wafer = self.store.items[0]
+            self.process_time = wafer.process_time[self.name]
+            self.wafer_maximum_residency = wafer.max_stay_time[self.name]
+            wait_time = self.wafer_start_time + self.process_time - current_time
+            if wait_time >= 0:  # 尚未加工完成，需要在当前PM前等待
+                self.fail = False
+                return wait_time
+            elif wait_time < 0 and wait_time + self.max_stay_time >= 0:  # 加工完成，但没有违反晶圆驻留时间约束
+                self.fail = False
+                return 0
+            else:  # 违反驻留时间约束
+                self.fail = True
+                return wait_time + self.wafer_maximum_residency
+
+    # ======= 获取当前PM的晶圆已经加工时间 =======
+    def get_wafer_processed_time(self):
+        if self.store.items.__len__() == 0:  # 当前不存在晶圆
+            return -1
+        if self.env.now - self.wafer_start_time > self.process_time:  # 如果已经加工完成，则返回模块的加工时间
+            return self.process_time
+        return self.env.now - self.wafer_start_time  # 返回晶圆实际加工时间
+
+    def get_wafer_residency_time(self):
+        if self.store.items.__len__() == 0:  # 当前不存在晶圆
+            return -1
+        return self.env.now - self.wafer_start_time
+
+
+# -------------------------------------------------
+#   LL类
+# -------------------------------------------------
+class Loadlock(object):
+    def __init__(self, env, name, wafer_num, module_list):
+        self.env = env
+        self.name = name
+        self.wafer_num = wafer_num  # 系统中的晶圆数量
+        # 核心修改：按类型分存储队列（类型1和类型2）
+        self.entry_stores = {1: simpy.Store(self.env), 2: simpy.Store(self.env)}  # 按类型存储待加工晶圆
+        self.exit_store = simpy.Store(self.env)  # 存储已完成晶圆
+        self.monitoring_data = []
+        self.system_state = "initial_transient"
+        self.fail = False
+        self.virtual_wafer_num = 0
+        self.entry_system_wafer_num = 0
+        self.module_list = module_list
+        self.last_unload_time = 0
+        self.idle_time = 0
+        self.system_wafer_count = 0
+        self.wafer_start_time = 0
+        self.wafer_type_count = {1: 0, 2: 0}  # 记录每种类型晶圆的数量
+
+    def initialize(self, wafers):
+        # 核心修改：按类型放入对应队列
+        for wafer in wafers:
+            self.entry_stores[wafer.wafer_type].put(wafer)  # 放入对应类型的存储队列
+            self.wafer_type_count[wafer.wafer_type] += 1
+        print(f"LL初始化完成: 类型1晶圆={self.wafer_type_count[1]}, 类型2晶圆={self.wafer_type_count[2]}")
+
+    # ======= 加载晶圆到LL =======
+    def load(self, wafer):
+        # 修改此处逻辑：检查晶圆是否完成所有必要步骤
+        if wafer.wafer_type == 1 and wafer.process_step == 3:  # 类型1晶圆完成3个步骤
+            pass  # 允许返回LL
+        elif wafer.wafer_type == 2 and wafer.process_step == 3:  # 类型2晶圆完成3个步骤
+            pass  # 允许返回LL
+        else:
+            self.fail = True
+            print(f"W{wafer.id}加载到LL失败，晶圆尚未完成！")
+            return
+
+        self.fail = False
+        self.exit_store.put(wafer)
+        self.wafer_type_count[wafer.wafer_type] -= 1
+        if self.exit_store.items.__len__() == self.wafer_num:  # 已经清空完毕
+            print(f"\n==========================加工完毕:{self.env.now}===========================")
+            print(f"清空用时:{self.env.now}")
+
+    # ======= 从LL卸载晶圆 =======
+    # 核心修改：增加wafer_type参数，按类型取出晶圆
+    def unload(self, wafer_type=None):
+        if wafer_type is None:
+                self.fail = True
+                print("卸载失败：未指定晶圆类型")
+                return None
+        # 检查对应类型的待加工晶圆是否存在
+        if self.entry_stores[wafer_type].items.__len__() == 0:
+            self.fail = True
+            print(f"卸载失败：类型{wafer_type}的待加工晶圆已耗尽")
+            return None
+        self.fail = False
+        # 从对应类型的队列中取出晶圆
+        wafer = self.entry_stores[wafer_type].get()
+        self.last_unload_time = self.env.now + 10
+        self.system_wafer_count += 1
+        self.wafer_type_count[wafer_type] -= 1  # 更新类型计数
+        if type(wafer) is simpy.resources.store.StoreGet:
+            return wafer.value
+        return wafer
+
+    # ======= 剩余加工晶圆数量=======
+    # 剩余加工晶圆数量（所有类型总和）
+    def get_remaining_wafer_count(self):
+        return sum(store.items.__len__() for store in self.entry_stores.values())
+
+    # ======= 已完成加工晶圆数量=======
+    def get_finished_wafer_count(self):
+        return self.exit_store.items.__len__()
+
+
+# -------------------------------------------------
+#   Robot类
+# -------------------------------------------------
+class Robot(object):
+    def __init__(self, env, name, move_time, work_time, unload_time_LL, current_module, loadlock):
+        self.env = env
+        self.name = name
+        self.store = simpy.Store(self.env)
+        self.unload_time_LL = unload_time_LL
+        self.move_time = move_time
+        self.work_time = work_time
+        self.monitoring_data = []
+        self.current_module = current_module
+        self.pre_module = None
+        self.wafer_start_time = 0
+        self.wait_time = 0
+        self.loadlock = loadlock
+        self.take_action_time = 0
+        self.action_start_time = 0
+        self.fail = False
+        self.carrying_wafer_type = None  # 记录当前携带的晶圆类型
+
+    # ======= 加载晶圆到robot =======
+    def load(self, wafer):
+        if self.store.items.__len__() == 1:
+            self.fail = True
+            return
+        self.fail = False
+        if self.current_module == "LL":
+            yield self.env.timeout(self.unload_time_LL)
+        else:
+            yield self.env.timeout(self.work_time)
+        self.store.put(wafer)
+        self.wafer_start_time = self.env.now
+        self.carrying_wafer_type = wafer.wafer_type  # 记录晶圆类型
+
+    # ======= 从robot卸载晶圆 =======
+    def unload(self):
+        if self.store.items.__len__() == 0:
+            self.fail = True
+            return None
+        self.fail = False
+        wafer = self.store.get()
+        self.wafer_start_time = 0
+        self.carrying_wafer_type = None  # 清空携带的晶圆类型
+        yield self.env.timeout(self.work_time)
+        if type(wafer) is simpy.resources.store.StoreGet:
+            return wafer.value
+        return wafer
+
+    # ======= 获取当前robot的晶圆数量 =======
+    def get_wafer_count(self):
+        return self.store.items.__len__()
+
+    # ======= robot移动到目标模块 =======
+    def move(self, target):
+        if self.current_module != target:
+            yield self.env.timeout(self.move_time)
+            self.pre_module = self.current_module
+            self.current_module = target
+
+
+# -------------------------------------------------
+#   环境类
+# -------------------------------------------------
+class Environment(object):
+
+    def __init__(self, args, wafer_num, wafer_type_distribution=None):
+        self.env = simpy.Environment()
+        self.robot_actions = args.robot_actions  # 分别表示不持有晶圆移动，等待，卸载，持有晶圆移动，加载
+        self.modules_list = args.modules_list
+        self.steps_list = args.steps_list
+        self.process_residency_time_dict = args.process_residency_time_dict
+        self.process_residency_time_list = args.process_residency_time_list
+        self.max_stay_time_dict = args.max_stay_time_dict
+        self.max_stay_time_list = args.max_stay_time_list
+        self.process_time_dict = args.process_time_dict
+        self.process_time_list = args.process_time_list
+        self.wait_time_dict = args.wait_time_dict
+        self.wait_time_list = args.wait_time_list
+        self.unload_time_LL = args.unload_time_LL
+        self.work_time = args.work_time
+        self.move_time = args.move_time
+        self.wafer_num = wafer_num
+        self.wafer_type_distribution = wafer_type_distribution or [0.5, 0.5]  # 默认两种晶圆各占50%
+
+        self.robot = None
+        self.loadlock = None
+        self.modules = list()
+        self.bottleneck_time = 0
+        self.state = list()
+        self.reward = 0
+        self.done = False
+        self.fail_flag = False
+        self.success_flag = False
+        self.state_dim = 0
+        self.action_dim = args.action_dim
+        self.actions = args.actions
+        self.robot_current_module = 'LL'  # 调度开始
+        self.initialize()
+
+    def initialize(self):
+        self.env = simpy.Environment()  # 创建环境
+
+        # 生成晶圆
+        wafers = self.generate_wafers(self.wafer_num, self.wafer_type_distribution)  # 编号从1开始
+
+        # 生成loadlock对象
+        self.loadlock = Loadlock(self.env, "LL", self.wafer_num, self.modules_list)
+        self.loadlock.initialize(wafers)
+
+        # 定义各PM允许处理的晶圆类型
+        pm_wafer_types = {
+            "PM1": [1], "PM2": [1], "PM3": [1],  # PM1-3处理类型1晶圆
+            "PM4": [2], "PM5": [2], "PM6": [2]   # PM4-6处理类型2晶圆
+        }
+
+        # 生成robot对象
+        self.robot = Robot(self.env, "robot", self.move_time, self.work_time, self.unload_time_LL,
+                           self.robot_current_module, self.loadlock)
+
+        # 初始化所有PM
+        self.modules.clear()
+        for i in range(1, len(self.modules_list)):  # 所有PM
+            pm_name = self.steps_list[i]
+            pre_pm = self.steps_list[i - 1]
+            next_pm = self.steps_list[i + 1] if i < len(self.steps_list) - 1 else None
+            PM = ProcessModule(self.env, pm_name, self.process_time_dict[pm_name], self.max_stay_time_dict[pm_name],
+                               self.wait_time_dict[pm_name],
+                               pre_pm, next_pm, self.loadlock, self.robot, self.modules,
+                               wafer_types_allowed=pm_wafer_types.get(pm_name, []))
+
+            self.modules.append(PM)
+
+        # 初始化各事件
+        self.event_entry = self.env.event()
+        self.event_exit = self.env.event()
+        self.event_hdlr = self.env.event()
+        self.event_step = self.env.event()
+        self.event_action = self.env.event()
+        self.events_robot_action = {event: self.env.event() for event in self.robot_actions}
+        if not self.events_robot_action["IDLE"].triggered:
+            self.events_robot_action["IDLE"].succeed()  # 初始时，robot处于IDLE状态
+
+        # 初始化动作、奖励、状态和各种标记
+        self.action, self.reward = 0, 0
+        self.fail_flag, self.success_flag, self.done = False, False, False
+        self.robot_action_flag = False
+        self.state = []
+        self.wafer_in_proc = 0
+
+        self.curr_nope_count = 0
+        self.profiler = self.init_system_profiler()
+        self.state_dim = self.profiler.get_state_dim()
+        self.bottleneck_time = sum(self.process_time_list)
+        self.process_handler = self.env.process(self.proc_handler())  # 处理器进程
+
+    # ======= 环境的外部接口 =======
+    # 每个episode的重置环境
+    def reset(self):
+        del self.env
+        self.initialize()
+        # 更新状态
+        for pm in self.modules:
+            wafer = pm.get_current_wafer()
+            wafer_type = wafer.wafer_type if wafer else None
+            self.profiler.update_modules_state(pm.name,
+                                               pm.store.items.__len__(),
+                                               pm.get_process_remaining_time(),
+                                               pm.get_residency_remaining_time(),
+                                               pm.state,
+                                               pm.wafer_start_time,
+                                               pm.get_wafer_state(),
+                                               pm.get_wafer_processed_time(),
+                                               pm.get_wafer_residency_time(),
+                                               wafer_type)
+
+        self.profiler.update_loadlock_state(self.loadlock.get_remaining_wafer_count(),
+                                            self.loadlock.get_finished_wafer_count())
+        self.profiler.update_robot_state(self.robot.current_module, self.robot.wait_time)
+        self.profiler.update_system_wafer_state()
+        self.state = self.profiler.get_state()
+        return self.state
+
+    # ======= 环境的外部接口 =======
+    # 接收外部动作，启动动作进程，返回下一状态、奖励、完成标记done
+    def step(self, action):
+        self.fail_flag = False
+        self.action = action
+        self.event_action.succeed()  # 触发event_action，即通知处理器proc_handler需要处理动作
+        print("******开始时间：", self.env.now)
+        self.robot.action_start_time = self.env.now
+        self.env.run(self.event_step)  # 运行环境，直到event_step触发
+        self.event_step = self.env.event()
+
+        print("******结束时间：", self.env.now)
+        self.f_time = self.env.now
+        obs = self.get_observation()
+
+        if self.done:
+            return obs
+        return obs
+
+    # ======= 初始化分析器 =======
+    # 主要用于获取状态、奖励
+    def init_system_profiler(self):
+        pm_names = list()
+        for pm in self.modules:
+            pm_names.append(pm.name)
+        profiler = system_profiler(pm_names, self.modules, self.loadlock, self.robot, self.wafer_num)
+        return profiler
+
+    # ======= 获取观测值obs =======
+    def get_observation(self):
+        for pm in self.modules:
+            if pm.store.items.__len__() == 1 and pm.get_residency_remaining_time() < 0:
+                self.fail_flag = True
+                print(f"{pm.name}违反驻留时间约束")
+                break
+        # 更新状态
+        for pm in self.modules:
+            wafer = pm.get_current_wafer()
+            wafer_type = wafer.wafer_type if wafer else None
+            self.profiler.update_modules_state(pm.name,
+                                               pm.store.items.__len__(),
+                                               pm.get_process_remaining_time(),
+                                               pm.get_residency_remaining_time(),
+                                               pm.state,
+                                               pm.wafer_start_time,
+                                               pm.get_wafer_state(),
+                                               pm.get_wafer_processed_time(),
+                                               pm.get_wafer_residency_time(),
+                                               wafer_type)
+
+        self.profiler.update_loadlock_state(self.loadlock.get_remaining_wafer_count(),
+                                            self.loadlock.get_finished_wafer_count())
+        self.profiler.update_robot_state(self.robot.current_module, self.robot.wait_time)
+
+        self.profiler.update_system_wafer_state()
+        # 获取状态
+        self.state = self.profiler.get_state()
+
+        # 获取奖励
+        self.reward, self.success_flag = self.profiler.get_reward(self.robot_action_flag, self.fail_flag,
+                                                                  self.bottleneck_time)
+        # 打印信息
+        self.profiler.print_info(self.reward, self.env)
+
+        if self.robot_action_flag and not self.fail_flag:
+            print("---------成功执行动作--------")
+
+        if self.fail_flag is True:  # 失败标记为真，结束
+            self.done = True
+            print(
+                "**********************************************************失败Terminate state!!!**********************************************************")
+        elif self.success_flag:
+            self.done = True
+            print(
+                "**********************************************************成功Terminate state!!!**********************************************************")
+
+        else:
+            self.done = False
+
+        return self.state, self.reward, self.done
+
+    # ======= 处理器 =======
+    def proc_handler(self):
+        while True:
+            yield (self.event_action)
+            if self.event_action.triggered:
+                self.event_action = self.env.event()
+            timeout_no_op = 1
+            self.robot_action_flag = False
+            action_taken = int(self.action)
+            self.robot.action_start_time = self.env.now
+            if action_taken >= 0 and action_taken < len(self.actions):
+                self.curr_nope_count = 0
+                self.env.process(self.execute_action(self.actions[action_taken]))
+            else:
+                self.fail_flag = True
+                if not self.event_step.triggered:
+                    self.event_step.succeed()
+                return
+
+    # ======= robot执行动作 =======
+    def execute_action(self, action):
+        print(f"===========Robot执行动作{action}===========")
+        self.robot.action_start_time = self.env.now
+        source_idx = action[0]  # 动作源索引（0对应LL）
+        target_idx = action[1]  # 动作目标索引（1对应PM1，4对应PM4等）
+        source_module = self.modules_list[source_idx]
+        target_module = self.modules_list[target_idx]
+        current_pm = None
+        self.robot_action_flag = False
+
+        # 核心修改：确定目标模块对应的晶圆类型（PM1-3对应类型1，PM4-6对应类型2）
+        target_wafer_type = None
+        if target_module in ["PM1", "PM2", "PM3"]:
+            target_wafer_type = 1
+        elif target_module in ["PM4", "PM5", "PM6"]:
+            target_wafer_type = 2
+
+        if not self.events_robot_action["MT"].triggered and self.events_robot_action['IDLE'].triggered:
+            self.events_robot_action["MT"].succeed()
+
+        # 1. 不携带晶圆移动到源模块（如果源是LL）
+        if self.events_robot_action["MT"].triggered:
+            print(f"时间:{self.env.now}\tRobot执行MT\t", self.robot.current_module, "——>", source_module)
+            yield self.env.process(self.robot.move(source_module))
+
+            if self.robot.current_module == "LL":
+                current_pm = self.loadlock
+            else:
+                current_pm = self.modules[self.modules_list.index(self.robot.current_module) - 1]
+
+            self.events_robot_action["MT"] = self.env.event()
+            if not self.events_robot_action["WT"].triggered:
+                self.events_robot_action["WT"].succeed()
+
+        # 2. 等待
+        if self.events_robot_action["WT"].triggered:
+            self.robot.wait_time = wait_time = 0
+            if current_pm.name != "LL":
+                wait_time = current_pm.get_wait_time()
+            print(f"时间:{self.env.now}\tRobot执行等待WT\t当前模块:{self.robot.current_module}\t等待时间为:{wait_time}")
+            if wait_time >= 0:
+                yield self.env.timeout(wait_time)
+                self.robot.wait_time = wait_time
+            self.fail_flag = current_pm.fail
+            self.events_robot_action["WT"] = self.env.event()
+            if self.fail_flag and not self.event_step.triggered:
+                self.robot.take_action_time = self.env.now - self.robot.action_start_time
+                self.event_step.succeed()
+                return
+            if not self.events_robot_action["UT"].triggered:
+                self.events_robot_action["UT"].succeed()
+
+        # 3. 卸载晶圆（从LL卸载时指定目标类型）
+        if self.events_robot_action["UT"].triggered:
+            print(f"时间:{self.env.now}\tRobot执行卸载UT\t当前模块:{current_pm.name}")
+            # 如果是从LL卸载，使用目标模块对应的类型取晶圆
+            if current_pm.name == "LL" and target_wafer_type is not None:
+                wafer_ut = current_pm.unload(wafer_type=target_wafer_type)  # 按类型取出
+            else:
+                wafer_ut = current_pm.unload()  # 非LL模块按原逻辑
+
+            # 检查卸载结果
+            if wafer_ut is None:
+                self.fail_flag = True
+                print(f"卸载失败：{current_pm.name}返回空晶圆，终止动作")
+                if not self.event_step.triggered:
+                    self.event_step.succeed()
+                return
+
+            # 加载到Robot
+            yield self.env.process(self.robot.load(wafer_ut))
+            self.events_robot_action["UT"] = self.env.event()
+
+            if (current_pm.fail or self.robot.fail) and not self.event_step.triggered:
+                self.fail_flag = True
+                self.robot.take_action_time = self.env.now - self.robot.action_start_time
+                self.event_step.succeed()
+                return
+
+            if not self.events_robot_action["CT"].triggered:
+                self.events_robot_action["CT"].succeed()
+
+        # 4. 携带晶圆移动到目标模块
+        if self.events_robot_action["CT"].triggered:
+            print(f"时间:{self.env.now}\tRobot执行CT\t{self.robot.current_module}——>{target_module}\t当前晶圆为:W{wafer_ut.id}")
+            yield self.env.process(self.robot.move(target_module))
+            if self.robot.current_module == "LL":
+                current_pm = self.loadlock
+            else:
+                current_pm = self.modules[self.modules_list.index(self.robot.current_module) - 1]
+            self.events_robot_action["CT"] = self.env.event()
+
+            if not self.events_robot_action["LT"].triggered:
+                self.events_robot_action["LT"].succeed()
+
+        # 5. 加载到目标模块
+        if self.events_robot_action["LT"].triggered:
+            print(f"时间:{self.env.now}\tRobot执行加载LT\t当前模块:{self.robot.current_module}")
+            wafer_lt = yield self.env.process(self.robot.unload())
+            current_pm.load(wafer_lt)
+
+            if (current_pm.fail or self.robot.fail):
+                self.fail_flag = True
+            else:
+                self.fail_flag = False
+
+            if not self.event_step.triggered:
+                self.event_step.succeed()
+            print("完成动作时间:", self.env.now)
+            self.robot.take_action_time = self.env.now - self.robot.action_start_time
+
+            if not self.fail_flag:
+                self.profiler.reward += 10  # 增加中间奖励,将某PM的晶圆成功移动到下一PM
+                self.robot_action_flag = True
+                self.events_robot_action["LT"] = self.env.event()
+                if not self.events_robot_action["IDLE"].triggered:
+                    self.events_robot_action["IDLE"].succeed()
+
+    # ======= 生成晶圆 =======
+    def generate_wafers(self, wafer_num, distribution):
+        """生成指定数量和类型分布的晶圆"""
+        wafer_list = list()
+        type1_count = int(wafer_num * distribution[0])
+        for i in range(wafer_num):
+            wafer_type = 1 if i < type1_count else 2
+            wafer_list.append(Wafer(i + 1, 'LL', False, self.process_time_dict, self.max_stay_time_dict,
+                                   self.wait_time_dict, wafer_type))
+        print(f"生成{wafer_num}个晶圆: 类型1={type1_count}, 类型2={wafer_num-type1_count}")
+        return wafer_list
+
+    def get_mask(self):
+        """生成动作掩码：合法动作=1，非法动作=0"""
+        mask = [True] * len(self.actions)  # 初始化所有动作都允许
+
+        # 获取各PM的晶圆数量（索引对应modules_list中的PM1-PM6）
+        pm1_wafer_count = self.modules[0].get_wafer_count() if len(self.modules) > 0 else 0  # PM1
+        pm2_wafer_count = self.modules[1].get_wafer_count() if len(self.modules) > 1 else 0  # PM2
+        pm3_wafer_count = self.modules[2].get_wafer_count() if len(self.modules) > 2 else 0  # PM3
+        pm4_wafer_count = self.modules[3].get_wafer_count() if len(self.modules) > 3 else 0  # PM4
+        pm5_wafer_count = self.modules[4].get_wafer_count() if len(self.modules) > 4 else 0  # PM5
+        pm6_wafer_count = self.modules[5].get_wafer_count() if len(self.modules) > 5 else 0  # PM6
+
+        # 其他PM（除目标PM外的所有PM）的晶圆数量总和
+        other_pms_when_pm1 = pm2_wafer_count + pm3_wafer_count + pm4_wafer_count + pm5_wafer_count + pm6_wafer_count
+        other_pms_when_pm2 = pm1_wafer_count + pm3_wafer_count + pm4_wafer_count + pm5_wafer_count + pm6_wafer_count
+        other_pms_when_pm3 = pm1_wafer_count + pm2_wafer_count + pm4_wafer_count + pm5_wafer_count + pm6_wafer_count
+        other_pms_when_pm4 = pm1_wafer_count + pm2_wafer_count + pm3_wafer_count + pm5_wafer_count + pm6_wafer_count
+        other_pms_when_pm5 = pm1_wafer_count + pm2_wafer_count + pm3_wafer_count + pm4_wafer_count + pm6_wafer_count
+        other_pms_when_pm6 = pm1_wafer_count + pm2_wafer_count + pm3_wafer_count + pm4_wafer_count + pm5_wafer_count
+        all_pms = pm1_wafer_count + pm2_wafer_count + pm3_wafer_count + pm4_wafer_count + pm5_wafer_count + pm6_wafer_count
+
+        #  所有PM不存在晶圆时，只允许[0,1],[0,4]
+        if all_pms == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [0, 4]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        #  当只有一个PM存在晶圆时
+        elif pm1_wafer_count > 0 and other_pms_when_pm1 == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [0, 4]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [3, 0], [4, 5], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count > 0 and other_pms_when_pm2 == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [2, 3], [0, 4]]:
+                    mask[i] = True
+                elif act in [[1, 2], [3, 0], [4, 5], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm3_wafer_count > 0 and other_pms_when_pm3 == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [0, 4]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [4, 5], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm4_wafer_count > 0 and other_pms_when_pm4 == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [4, 5]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [3, 0], [0, 4], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm5_wafer_count > 0 and other_pms_when_pm5 == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [0, 4], [5, 6]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [3, 0], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm6_wafer_count > 0 and other_pms_when_pm6 == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [3, 0], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        #  当有两个PM存在晶圆时
+        elif pm1_wafer_count > 0 and pm2_wafer_count > 0 and (all_pms - pm1_wafer_count - pm2_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[2, 3], [0, 4]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [3, 0], [4, 5], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count > 0 and pm3_wafer_count > 0 and (all_pms - pm1_wafer_count - pm3_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [3, 0], [0, 4]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [4, 5], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count > 0 and pm4_wafer_count > 0 and (all_pms - pm1_wafer_count - pm4_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [4, 5]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [3, 0], [0, 4], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count > 0 and pm5_wafer_count > 0 and (all_pms - pm1_wafer_count - pm5_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [0, 4], [5, 6]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [3, 0], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count > 0 and pm6_wafer_count > 0 and (all_pms - pm1_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [3, 0], [0, 4], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count > 0 and pm3_wafer_count > 0 and (all_pms - pm2_wafer_count - pm3_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [0, 4]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [4, 5], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count > 0 and pm4_wafer_count > 0 and (all_pms - pm2_wafer_count - pm4_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [2, 3], [4, 5]]:
+                    mask[i] = True
+                elif act in [[1, 2], [3, 0], [0, 4], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count > 0 and pm5_wafer_count > 0 and (all_pms - pm2_wafer_count - pm5_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [2, 3], [0, 4], [5, 6]]:
+                    mask[i] = True
+                elif act in [[1, 2], [3, 0], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count > 0 and pm6_wafer_count > 0 and (all_pms - pm2_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [2, 3], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [3, 0], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm3_wafer_count > 0 and pm4_wafer_count > 0 and (all_pms - pm3_wafer_count - pm4_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [4, 5]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [0, 4], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm3_wafer_count > 0 and pm5_wafer_count > 0 and (all_pms - pm3_wafer_count - pm5_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [0, 4], [5, 6]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm3_wafer_count > 0 and pm6_wafer_count > 0 and (all_pms - pm3_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm4_wafer_count > 0 and pm5_wafer_count > 0 and (all_pms - pm4_wafer_count - pm5_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [5, 6]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [3, 0], [0, 4], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm4_wafer_count > 0 and pm6_wafer_count > 0 and (all_pms - pm4_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [4, 5], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [3, 0], [0, 4], [5, 6]]:
+                    mask[i] = False
+
+        elif pm5_wafer_count > 0 and pm6_wafer_count > 0 and (all_pms - pm5_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [3, 0], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        #  当有三个PM存在晶圆时
+        elif pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm3_wafer_count > 0 and (
+                all_pms - pm1_wafer_count - pm2_wafer_count - pm3_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[3, 0], [0, 4]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [2, 3], [4, 5], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm4_wafer_count > 0 and (
+                all_pms - pm1_wafer_count - pm2_wafer_count - pm4_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[2, 3], [4, 5]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [3, 0], [0, 4], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm5_wafer_count > 0 and (
+                all_pms - pm1_wafer_count - pm2_wafer_count - pm5_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[2, 3], [0, 4], [5, 6]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [3, 0], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm6_wafer_count > 0 and (
+                all_pms - pm1_wafer_count - pm2_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[2, 3], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [3, 0], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count > 0 and pm3_wafer_count > 0 and pm4_wafer_count > 0 and (
+                all_pms - pm1_wafer_count - pm3_wafer_count - pm4_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [3, 0], [4, 5]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [0, 4], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count > 0 and pm3_wafer_count > 0 and pm5_wafer_count > 0 and (
+                all_pms - pm1_wafer_count - pm3_wafer_count - pm5_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [3, 0], [0, 4], [5, 6]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count > 0 and pm3_wafer_count > 0 and pm6_wafer_count > 0 and (
+                all_pms - pm1_wafer_count - pm3_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [3, 0], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0 and (
+                all_pms - pm1_wafer_count - pm4_wafer_count - pm5_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [5, 6]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [3, 0], [0, 4], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count > 0 and pm4_wafer_count > 0 and pm6_wafer_count > 0 and (
+                all_pms - pm1_wafer_count - pm4_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [4, 5], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [3, 0], [0, 4], [5, 6]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0 and (
+                all_pms - pm1_wafer_count - pm5_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [3, 0], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm4_wafer_count > 0 and (
+                all_pms - pm2_wafer_count - pm3_wafer_count - pm4_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [4, 5]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [0, 4], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm5_wafer_count > 0 and (
+                all_pms - pm2_wafer_count - pm3_wafer_count - pm5_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [0, 4], [5, 6]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm6_wafer_count > 0 and (
+                all_pms - pm2_wafer_count - pm3_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [0, 4], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0 and (
+                all_pms - pm2_wafer_count - pm4_wafer_count - pm5_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [2, 3], [5, 6]]:
+                    mask[i] = True
+                elif act in [[1, 2], [3, 0], [0, 4], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count > 0 and pm4_wafer_count > 0 and pm6_wafer_count > 0 and (
+                all_pms - pm2_wafer_count - pm4_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [2, 3], [4, 5], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [3, 0], [0, 4], [5, 6]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0 and (
+                all_pms - pm2_wafer_count - pm5_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [2, 3], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [3, 0], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm3_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0 and (
+                all_pms - pm3_wafer_count - pm4_wafer_count - pm5_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [5, 6]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [0, 4], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm3_wafer_count > 0 and pm4_wafer_count > 0 and pm6_wafer_count > 0 and (
+                all_pms - pm3_wafer_count - pm4_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [4, 5], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [0, 4], [5, 6]]:
+                    mask[i] = False
+
+        elif pm3_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0 and (
+                all_pms - pm3_wafer_count - pm5_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm4_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0 and (
+                all_pms - pm4_wafer_count - pm5_wafer_count - pm6_wafer_count) == 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [3, 0], [0, 4], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        #  当有四个PM存在晶圆时
+        elif pm1_wafer_count == 0 and pm2_wafer_count == 0 and pm3_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [0, 4], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count == 0 and pm3_wafer_count == 0 and pm2_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [2, 3], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [3, 0], [0, 4], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count == 0 and pm4_wafer_count == 0 and pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count == 0 and pm5_wafer_count == 0 and pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm4_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [4, 5], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [0, 4], [5, 6]]:
+                    mask[i] = False
+
+        elif pm1_wafer_count == 0 and pm6_wafer_count == 0 and pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [5, 6]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [0, 4], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count == 0 and pm3_wafer_count == 0 and pm1_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [3, 0], [0, 4], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count == 0 and pm4_wafer_count == 0 and pm1_wafer_count > 0 and pm3_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [3, 0], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count == 0 and pm5_wafer_count == 0 and pm1_wafer_count > 0 and pm3_wafer_count > 0 and pm4_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [3, 0], [4, 5], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [0, 4], [5, 6]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count == 0 and pm6_wafer_count == 0 and pm1_wafer_count > 0 and pm3_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [3, 0], [5, 6]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [0, 4], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm3_wafer_count == 0 and pm4_wafer_count == 0 and pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[2, 3], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [3, 0], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm3_wafer_count == 0 and pm5_wafer_count == 0 and pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm4_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[2, 3], [4, 5], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [3, 0], [0, 4], [5, 6]]:
+                    mask[i] = False
+
+        elif pm3_wafer_count == 0 and pm6_wafer_count == 0 and pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[2, 3], [5, 6]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [3, 0], [0, 4], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm4_wafer_count == 0 and pm5_wafer_count == 0 and pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[3, 0], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [2, 3], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm4_wafer_count == 0 and pm6_wafer_count == 0 and pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm5_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[3, 0], [0, 4], [5, 6]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [2, 3], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        elif pm5_wafer_count == 0 and pm6_wafer_count == 0 and pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm4_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[3, 0], [4, 5]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [2, 3], [0, 4], [5, 6], [6, 0]]:
+                    mask[i] = False
+
+        #  当有五个PM存在晶圆时
+        elif pm1_wafer_count == 0 and pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[0, 1], [3, 0], [6, 0]]:
+                    mask[i] = True
+                elif act in [[1, 2], [2, 3], [0, 4], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm2_wafer_count == 0 and pm1_wafer_count > 0 and pm3_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[1, 2], [3, 0], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [2, 3], [0, 4], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm3_wafer_count == 0 and pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[2, 3], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [3, 0], [0, 4], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm4_wafer_count == 0 and pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[3, 0], [0, 4], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [2, 3], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        elif pm5_wafer_count == 0 and pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm4_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[3, 0], [4, 5], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [2, 3], [0, 4], [5, 6]]:
+                    mask[i] = False
+
+        elif pm6_wafer_count == 0 and pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[3, 0], [5, 6]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [2, 3], [0, 4], [4, 5], [6, 0]]:
+                    mask[i] = False
+
+        #   当有六个PM存在晶圆
+        elif pm1_wafer_count > 0 and pm2_wafer_count > 0 and pm3_wafer_count > 0 and pm4_wafer_count > 0 and pm5_wafer_count > 0 and pm6_wafer_count > 0:
+            for i, act in enumerate(self.actions):
+                if act in [[3, 0], [6, 0]]:
+                    mask[i] = True
+                elif act in [[0, 1], [1, 2], [2, 3], [0, 4], [4, 5], [5, 6]]:
+                    mask[i] = False
+
+        return mask
+
+if __name__ == "__main__":
+
+    robot_actions = ["MT", "WT", "UT", "CT", "LT", "IDLE"]  # 分别表示不持有晶圆移动，等待，卸载，持有晶圆移动，加载
+    modules_list = ["LL", "PM1", "PM2", "PM3", "PM4", "PM5", "PM6"]
+    steps_list = ["LL", "PM1", "PM2", "PM3", "PM4", "PM5", "PM6", "LL"]
+    process_residency_time_dict = {"LL": [0, 0], "PM1": [90, 20], "PM2": [115, 20], "PM3": [105, 20], "PM4": [100, 20],
+                                   "PM5": [100, 20], "PM6": [100, 20]}
+    process_residency_time_list = [[0, 0], [90, 20], [115, 20], [105, 20], [100, 20], [100, 20], [100, 20]]
+    max_stay_time_dict = {"LL": 0, "PM1": 20, "PM2": 20, "PM3": 20, "PM4": 20, "PM5": 20, "PM6": 20}
+    max_stay_time_list = [0, 20, 20, 20, 20, 20, 20]
+    process_time_dict = {"LL": 0, "PM1": 90, "PM2": 115, "PM3": 105, "PM4": 100, "PM5": 100, "PM6": 100}
+    process_time_list = [0, 90, 115, 105, 100, 100, 100]
+    wait_time_dict = {"LL": 0, "PM1": 0, "PM2": 0, "PM3": 0, "PM4": 0, "PM5": 0, "PM6": 38}
+    wait_time_list = [0, 0, 0, 0, 0, 0, 38]
+    unload_time_LL = 10
+    work_time = 5
+    move_time = 2
+    # 动作空间
+    actions = [
+        [0, 1], [1, 2], [2, 3], [3, 0],  # 类型1路径: PM1→PM2→PM3→LL    0 1 2 3
+        [0, 4], [4, 5], [5, 6], [6, 0],   # 类型2路径: PM4→PM5→PM6→LL   4 5 6 7
+    ]
+    action_dim = len(actions)
+
+    wafer_num = 10  # 总晶圆数量
+    # 两种晶圆各占一半
+    wafer_type_distribution = [0.5, 0.5]  # 类型A:类型B = 1:1
+
+    # params for cluster-tool:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--robot_actions', default=robot_actions, type=list)
+    parser.add_argument('--modules_list', default=modules_list, type=list)
+    parser.add_argument('--steps_list', default=steps_list, type=list)
+    parser.add_argument('--process_residency_time_dict', default=process_residency_time_dict, type=dict)
+    parser.add_argument('--process_residency_time_list', default=process_residency_time_list, type=list)
+    parser.add_argument('--max_stay_time_dict', default=max_stay_time_dict, type=dict)
+    parser.add_argument('--max_stay_time_list', default=max_stay_time_list, type=list)
+    parser.add_argument('--process_time_dict', default=process_time_dict, type=dict)
+    parser.add_argument('--process_time_list', default=process_time_list, type=list)
+    parser.add_argument('--wait_time_dict', default=wait_time_dict, type=dict)
+    parser.add_argument('--wait_time_list', default=wait_time_list, type=list)
+    parser.add_argument('--unload_time_LL', default=unload_time_LL, type=int)
+    parser.add_argument('--work_time', default=work_time, type=int)
+    parser.add_argument('--move_time', default=move_time, type=int)
+    parser.add_argument('--actions', default=actions, type=list)
+    parser.add_argument('--action_dim', default=action_dim, type=int)
+    parser.add_argument('--wafer_num', default=wafer_num, type=int)
+    args = parser.parse_args()
+
+    env = Environment(args, wafer_num, wafer_type_distribution)
+    env.get_observation()
+
+    #actions = [0, 4, 1, 5, 0, 4, 2, 6, 1, 5, 3, 7, 2, 6, 3, 7]   # wafer_num = 4  总晶圆数量
+    #actions = [0, 4, 1, 0, 5, 4, 2, 1, 6, 5, 3, 2, 7, 6, 3, 7]  # wafer_num = 4  总晶圆数量 527
+    #actions = [0, 4, 1, 0, 5, 4, 2, 1, 6, 5, 3, 7, 2, 6, 3, 7,]  # wafer_num = 4  总晶圆数量
+    #actions = [4, 0, 5, 1, 4, 0, 6, 2, 5, 1, 7, 3, 6, 2, 7, 3]  # wafer_num = 4  总晶圆数量
+
+    actions = [ 0, 4, 1, 0, 5, 4, 2, 1, 6, 5,
+                0, 4, 3, 7, 2, 6, 1, 5,
+                0, 4, 3, 7, 2, 6, 1, 5,
+                0, 4, 3, 7, 2, 6, 1, 5,
+                3, 7, 2, 6, 3, 7]                   # wafer_num = 10
+
+    for a in actions:
+        state, reward, done = env.step(a)
+        #print(env.get_mask())
+        if done:
+            break
+
+
+
+
